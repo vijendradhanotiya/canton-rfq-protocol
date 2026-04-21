@@ -1,0 +1,73 @@
+-- | This module defines the core Request for Quote (RFQ) template.
+-- It allows a requester to broadcast a request to a list of approved market makers,
+-- initiating the sealed-quote workflow.
+module RFQ.Request where
+
+import DA.Assert
+import DA.Time (Time)
+
+-- Forward import for the sealed quote contract, which will be created by a choice on this template.
+import RFQ.Quote (SealedQuote)
+
+-- | Represents the side of a trade. The requester is either looking to Buy or Sell the asset.
+data Side = Buy | Sell
+  deriving (Eq, Show, Ord)
+
+-- | Represents a request for a quote broadcast to multiple market makers.
+-- The requester creates this contract to solicit quotes for a specific asset.
+-- Market makers observe this contract and can respond by submitting a sealed quote.
+template Request
+  with
+    requester      : Party    -- ^ The party requesting the quote.
+    marketMakers   : [Party]  -- ^ The list of parties invited to provide a quote.
+    requestId      : Text     -- ^ A unique identifier for this RFQ, chosen by the requester.
+    asset          : Text     -- ^ The asset to be traded, e.g., "BTC/USD".
+    side           : Side     -- ^ Whether the requester wants to buy or sell the base asset.
+    quantity       : Decimal  -- ^ The amount of the asset to be traded.
+    quoteDeadline  : Time     -- ^ The time by which market makers must submit their sealed quotes.
+  where
+    signatory requester
+    observer marketMakers
+
+    ensure
+      quantity > 0.0 &&
+      not (null marketMakers) &&
+      notElem requester marketMakers
+
+    key (requester, requestId) : (Party, Text)
+    maintainer key._1
+
+    -- | Allows a market maker to submit a sealed quote in response to the RFQ.
+    -- This choice creates a `SealedQuote` contract, which holds the hash of the quote details.
+    -- The actual quote is not revealed at this stage, preserving confidentiality until the
+    -- selection process begins.
+    choice SubmitSealedQuote : ContractId SealedQuote
+      with
+        quoteHash: Text -- ^ A SHA256 hash of the quote details (price, timestamp, salt).
+      controller responder
+      do
+        -- Ensure the controller is one of the invited market makers.
+        assertMsg "Controller must be an invited market maker" $
+          elem responder marketMakers
+
+        -- Ensure the submission is before the deadline.
+        now <- getTime
+        assertMsg "Quote submission deadline has passed" $
+          now <= quoteDeadline
+
+        -- Create the sealed quote contract, linking it back to this RFQ.
+        create SealedQuote with
+          requester
+          marketMaker = responder
+          requestId
+          quoteHash
+
+    -- | Allows the requester to cancel the RFQ before the deadline has passed.
+    -- This is useful if the requester's needs change or if the request was made in error.
+    choice Cancel : ()
+      controller requester
+      do
+        now <- getTime
+        assertMsg "Cannot cancel RFQ after the quote deadline" $
+          now < quoteDeadline
+        return ()
