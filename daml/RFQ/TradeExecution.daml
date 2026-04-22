@@ -1,0 +1,182 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RFQ.TradeExecution where
+
+import Daml.Script
+import DA.Time (Time, getTime)
+import DA.Assert ((===))
+import RFQ.Request (TradeDetails(..), TradeDirection(..))
+
+-- NOTE: In a real production application, the Iou and its Transfer choice would be
+-- defined in a separate, shared module (e.g., `Shared.Asset`) or imported from a
+-- standard token library (like one implementing CIP-0056). It is included here
+-- to make this file self-contained and compilable for demonstration purposes.
+template Iou
+  with
+    issuer: Party
+    owner: Party
+    asset: Text
+    quantity: Decimal
+  where
+    signatory issuer
+    observer owner
+
+    ensure quantity > 0.0
+
+    choice Transfer : ContractId Iou
+      with
+        newOwner: Party
+      controller owner
+      do
+        assertMsg "New owner cannot be the same as the current owner" (newOwner /= owner)
+        create this with owner = newOwner
+
+-- | Represents an agreed-upon trade between a requester and a market maker,
+-- | ready for atomic settlement. This contract is typically created after a
+-- | winning quote has been selected and confirmed by both parties.
+template PendingTrade
+  with
+    requester: Party
+    marketMaker: Party
+    tradeDetails: TradeDetails
+    price: Decimal -- Price in quoteAsset per unit of baseAsset
+    requestId: Text
+  where
+    signatory requester, marketMaker
+
+    -- | Atomically settles the trade using a Delivery-vs-Payment (DVP) pattern.
+    -- | Both parties provide their respective asset contracts (Ious), which are
+    -- | then swapped in a single atomic transaction. The choice is controllable
+    -- | by both parties, ensuring mutual consent for settlement.
+    choice Settle : ContractId SettledTrade
+      with
+        -- | The Iou contract for the asset being provided by the Requester.
+        requesterProvidedAssetCid: ContractId Iou
+        -- | The Iou contract for the asset being provided by the Market Maker.
+        marketMakerProvidedAssetCid: ContractId Iou
+      controller requester, marketMaker
+      do
+        -- Determine which asset each party provides based on trade direction
+        let (requesterGivesAsset, requesterGivesQuantity, marketMakerGivesAsset, marketMakerGivesQuantity) =
+              case tradeDetails.direction of
+                Buy -> -- Requester buys baseAsset, sells quoteAsset
+                  ( tradeDetails.quoteAsset
+                  , tradeDetails.quantity * price
+                  , tradeDetails.baseAsset
+                  , tradeDetails.quantity
+                  )
+                Sell -> -- Requester sells baseAsset, buys quoteAsset
+                  ( tradeDetails.baseAsset
+                  , tradeDetails.quantity
+                  , tradeDetails.quoteAsset
+                  , tradeDetails.quantity * price
+                  )
+
+        -- Fetch and verify the asset provided by the requester
+        requesterIou <- fetch requesterProvidedAssetCid
+        requesterIou.owner === requester
+        requesterIou.asset === requesterGivesAsset
+        requesterIou.quantity === requesterGivesQuantity
+
+        -- Fetch and verify the asset provided by the market maker
+        marketMakerIou <- fetch marketMakerProvidedAssetCid
+        marketMakerIou.owner === marketMaker
+        marketMakerIou.asset === marketMakerGivesAsset
+        marketMakerIou.quantity === marketMakerGivesQuantity
+
+        -- Atomically transfer the assets
+        exercise requesterProvidedAssetCid Transfer with newOwner = marketMaker
+        exercise marketMakerProvidedAssetCid Transfer with newOwner = requester
+
+        -- Create a record of the settled trade
+        now <- getTime
+        create SettledTrade with
+          settledAt = now
+          ..
+
+-- | An immutable record representing a successfully completed and settled trade.
+-- | This contract serves as a final confirmation on the ledger for audit and
+-- | reconciliation purposes.
+template SettledTrade
+  with
+    requester: Party
+    marketMaker: Party
+    tradeDetails: TradeDetails
+    price: Decimal
+    requestId: Text
+    settledAt: Time
+  where
+    signatory requester, marketMaker
+
+-- | Test script to illustrate the settlement workflow.
+settlementScript : Script ()
+settlementScript = script do
+  -- 1. Allocate parties
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+  bank <- allocatePartyWithHint "Bank" (PartyIdHint "Bank")
+
+  -- 2. Define trade parameters
+  let
+    details = TradeDetails with
+      direction = Buy -- Alice (requester) is buying BTC
+      baseAsset = "BTC"
+      quoteAsset = "USD"
+      quantity = 2.0
+    tradePrice = 50000.0 -- 50,000 USD per BTC
+    requestId = "RFQ-2024-001"
+    usdAmount = details.quantity * tradePrice -- 100,000.0
+
+  -- 3. Issue assets to parties. Alice needs USD, Bob needs BTC.
+  -- In a real system, these would already exist on the ledger.
+  aliceUsdCid <- submit bank do
+    create Iou with issuer = bank, owner = alice, asset = "USD", quantity = usdAmount
+  bobBtcCid <- submit bank do
+    create Iou with issuer = bank, owner = bob, asset = "BTC", quantity = details.quantity
+
+  -- 4. Create the PendingTrade contract (assuming it was created by the previous RFQ step)
+  pendingTradeCid <- submitMulti [alice, bob] [] do
+    create PendingTrade with
+      requester = alice
+      marketMaker = bob
+      tradeDetails = details
+      price = tradePrice
+      requestId = requestId
+
+  -- 5. Settle the trade. The command can be submitted by either party, as both
+  -- are controllers on the `Settle` choice. Daml ensures both parties authorize
+  -- the transaction.
+  settledTradeCid <- submit alice do
+    exercise pendingTradeCid Settle with
+      requesterProvidedAssetCid = aliceUsdCid
+      marketMakerProvidedAssetCid = bobBtcCid
+
+  -- 6. Verify the outcome
+  -- The PendingTrade contract should be archived
+  (submitMustFail alice do fetch pendingTradeCid)
+
+  -- A SettledTrade contract should exist and be visible to both parties
+  settledTradeAlice <- fetch settledTradeCid
+  settledTradeAlice.requester === alice
+  settledTradeAlice.marketMaker === bob
+  settledTradeAlice.price === tradePrice
+
+  settledTradeBob <- submit bob do fetch settledTradeCid
+  settledTradeBob === settledTradeAlice
+
+  -- Verify new ownership of assets
+  -- Alice should now own BTC
+  [(_, btcForAlice)] <- queryContracts (pact alice)
+  btcForAlice.owner === alice
+  btcForAlice.asset === "BTC"
+  btcForAlice.quantity === details.quantity
+
+  -- Bob should now own USD
+  [(_, usdForBob)] <- queryContracts (pact bob)
+  usdForBob.owner === bob
+  usdForBob.asset === "USD"
+  usdForBob.quantity === usdAmount
+
+  debug "Trade settlement successful."
+  return ()
