@@ -1,0 +1,93 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RFQ.SealedQuote where
+
+import Daml.Script
+import DA.Date as D
+import RFQ.Request (Request)
+import RFQ.Model (Side(..))
+
+-- | Represents a quote submitted by a market maker (provider) in response to an RFQ.
+-- This contract is "sealed" in the sense that it is only visible to the provider
+-- and the requester, not to other competing providers on the same RFQ. This is
+-- achieved by making only the provider and requester stakeholders on the contract,
+-- leveraging Daml's privacy model.
+template SealedQuote
+  with
+    provider: Party
+      -- ^ The market maker submitting the quote.
+    requester: Party
+      -- ^ The party that initiated the RFQ.
+    requestCid: ContractId Request
+      -- ^ The contract ID of the original RFQ.Request.
+    request: Request
+      -- ^ A copy of the original request data for convenience.
+    price: Decimal
+      -- ^ The price quoted by the provider for the base asset, in terms of the quote asset.
+  where
+    signatory requester, provider
+
+    key (requester, provider, request.id) : (Party, Party, Text)
+    maintainer key._1
+
+    ensure request.requester == requester
+      && elem provider request.providers
+
+    -- | The requester accepts this quote, leading to a confirmed trade.
+    -- Accepting this quote implies that all other competing quotes for the same
+    -- RFQ should be declined/archived. The logic for that would typically
+    -- live in a script or off-ledger application that queries for all quotes
+    -- related to a request, accepts one, and declines the others.
+    choice Accept : ContractId TradeConfirmation
+      controller requester
+      do
+        now <- getTime
+        let tradeDate = D.toDateUTC now
+        -- Assuming a T+2 settlement cycle for institutional trades.
+        let settlementDate = D.addDays tradeDate 2
+
+        create TradeConfirmation with
+          buyer = case request.side of
+                    Buy -> requester
+                    Sell -> provider
+          seller = case request.side of
+                     Buy -> provider
+                     Sell -> requester
+          baseAsset = request.baseAsset
+          quoteAsset = request.quoteAsset
+          quantity = request.quantity
+          price
+          totalConsideration = request.quantity * price
+          tradeDate
+          settlementDate
+          tradeId = request.id
+
+    -- | The requester declines this quote. This is typically done for all
+    -- losing quotes after the winning quote has been accepted.
+    choice Decline : ()
+      controller requester
+      do
+        pure ()
+
+
+-- | Represents the post-trade confirmation of an executed RFQ.
+-- This contract would be the input to a subsequent settlement workflow,
+-- for example, a Delivery-vs-Payment (DvP) instruction.
+template TradeConfirmation
+  with
+    buyer: Party
+    seller: Party
+    baseAsset: Text
+    quoteAsset: Text
+    quantity: Decimal
+    price: Decimal
+    totalConsideration: Decimal
+    tradeDate: D.Date
+    settlementDate: D.Date
+    tradeId: Text
+  where
+    signatory buyer, seller
+
+    key (buyer, seller, tradeId) : (Party, Party, Text)
+    maintainer key._1
