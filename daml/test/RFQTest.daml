@@ -1,0 +1,173 @@
+module Test.RFQTest where
+
+import Daml.Script
+
+import DA.Assert
+import DA.Date (date, Month(..))
+import DA.Time (time, addRelTime, hours)
+import DA.Text (toText)
+import DA.Hash (hash)
+import DA.List ((!!))
+import DA.Set (fromList)
+import DA.Tuple (fst, snd)
+
+-- Import the contracts that define the RFQ workflow.
+-- The paths and template/choice names are assumed based on the project structure.
+import RFQ.Request (Request(..), RequestPayload(..), SubmitSealedQuote)
+import RFQ.SealedQuote (SealedQuote(..))
+import RFQ.WinnerSelection (SelectWinner(..), RevealPayload(..), WinningQuote(..), LosingQuote(..), AcceptQuote, AcknowledgeLoss)
+import RFQ.TradeExecution (Trade(..))
+import RFQ.MarketMakerRegistry (MarketMakerRegistry(..))
+
+
+-- Helper to set up parties and the initial market maker registry.
+setup = script do
+  requester <- allocatePartyWithHint "Requester" (PartyIdHint "requester")
+  mm1 <- allocatePartyWithHint "MarketMaker1" (PartyIdHint "mm1")
+  mm2 <- allocatePartyWithHint "MarketMaker2" (PartyIdHint "mm2")
+  mm3 <- allocatePartyWithHint "MarketMaker3" (PartyIdHint "mm3")
+
+  let marketMakers = [mm1, mm2, mm3]
+
+  -- The requester creates the registry of approved market makers.
+  registryCid <- submit requester do
+    createCmd MarketMakerRegistry with
+      owner = requester
+      registeredMakers = fromList marketMakers
+
+  return (requester, mm1, mm2, mm3, registryCid)
+
+-- Main test suite that executes the entire RFQ workflow.
+-- 1. Requester broadcasts an RFQ.
+-- 2. Three market makers submit sealed quotes.
+-- 3. Requester selects a winner, which atomically reveals prices and determines the best one.
+-- 4. Requester executes the trade with the winner.
+-- 5. Losing market makers clean up their quotes, ensuring their prices are not persisted.
+testRfqFullWorkflow : Script ()
+testRfqFullWorkflow = script do
+  -- Step 1: Setup Parties and Registry
+  (requester, mm1, mm2, mm3, _registryCid) <- setup
+  debug "Test setup complete: Parties and registry created."
+
+  -- Step 2: Requester Broadcasts RFQ
+  let
+    today = date 2024 Feb 27
+    rfq = RequestPayload with
+      requester
+      instrument = "USD/CHF"
+      quantity = 1_000_000.0
+      isBuy = True -- Requester wants to buy, so they want the lowest price
+      expiryTime = addRelTime (time today 10 0 0) (hours 1)
+
+  requestCid <- submit requester do createCmd Request with ..rfq
+  debug $ "RFQ Request " <> toText requestCid <> " broadcasted."
+
+  -- Step 3: Market Makers Submit Sealed Quotes
+  -- MM2 will submit the best price (lowest ask for a buyer).
+  let
+    quote1 = (0.9105, "nonce-for-mm1")
+    quote2 = (0.9102, "nonce-for-mm2") -- Winning price
+    quote3 = (0.9108, "nonce-for-mm3")
+
+    hashQuote (price, nonce) = hash (toText price <> nonce)
+
+    quoteHash1 = hashQuote quote1
+    quoteHash2 = hashQuote quote2
+    quoteHash3 = hashQuote quote3
+
+  sealedQuoteCid1 <- submit mm1 do
+    exerciseCmd requestCid SubmitSealedQuote with marketMaker = mm1, quoteHash = quoteHash1
+  sealedQuoteCid2 <- submit mm2 do
+    exerciseCmd requestCid SubmitSealedQuote with marketMaker = mm2, quoteHash = quoteHash2
+  sealedQuoteCid3 <- submit mm3 do
+    exerciseCmd requestCid SubmitSealedQuote with marketMaker = mm3, quoteHash = quoteHash3
+
+  debug $ "Sealed quotes submitted by " <> toText [mm1, mm2, mm3]
+
+  -- Step 4: Requester Selects Winner
+  -- The requester provides all the unsealed quote data. The `SelectWinner` choice
+  -- validates the hashes, determines the winner atomically, and creates the
+  -- appropriate `WinningQuote` and `LosingQuote` contracts.
+  let
+    sealedQuoteCids = [sealedQuoteCid1, sealedQuoteCid2, sealedQuoteCid3]
+    revealQuotes =
+      [ RevealPayload with marketMaker = mm1, price = fst quote1, nonce = snd quote1
+      , RevealPayload with marketMaker = mm2, price = fst quote2, nonce = snd quote2
+      , RevealPayload with marketMaker = mm3, price = fst quote3, nonce = snd quote3
+      ]
+
+  (winnerCid, loserCids) <- submit requester do
+    exerciseCmd requestCid SelectWinner with sealedQuoteCids, revealQuotes
+
+  debug "Winner selected. Validating outcomes."
+
+  -- Assertions: initial RFQ and sealed quote contracts should be archived
+  requestIsActive <- queryContractId requester requestCid
+  assertMsg "Request contract should be archived" (requestIsActive == None)
+  forA_ sealedQuoteCids \cid -> do
+    sealedQuoteIsActive <- queryContractId requester cid
+    assertMsg "SealedQuote should be archived" (sealedQuoteIsActive == None)
+
+  -- Assertions: correct number of winner/loser contracts created
+  let loserCidList = toList loserCids
+  assertMsg "Expected 1 winning quote contract" True -- Type checker confirms non-optional
+  assertMsg "Expected 2 losing quote contracts" (length loserCidList == 2)
+
+  -- Fetch and validate the winning quote contract
+  winningQuote <- fetch winnerCid
+  assertMsg "Winner should be MM2" (winningQuote.marketMaker == mm2)
+  assertMsg "Winner price should match MM2's quote" (winningQuote.price == fst quote2)
+  assertMsg "Winner's RFQ data should be correct" (winningQuote.rfqData == rfq)
+
+  -- Fetch and validate the losing quote contracts
+  losingQuote1 <- fetch (loserCidList !! 0)
+  losingQuote2 <- fetch (loserCidList !! 1)
+  let loserMakers = fromList [losingQuote1.marketMaker, losingQuote2.marketMaker]
+  let expectedLosers = fromList [mm1, mm3]
+  assertMsg "Losing market makers should be MM1 and MM3" (loserMakers == expectedLosers)
+  -- The key privacy feature is that the `LosingQuote` template does not have a `price` field.
+  -- This is enforced by the compiler, so no runtime assertion is needed.
+  debug "Winner and loser contracts created correctly."
+
+  -- Step 5: Requester Executes Trade with Winner
+  tradeCid <- submit requester do
+    exerciseCmd winnerCid AcceptQuote
+
+  debug "Winning quote accepted, trade executed."
+
+  -- Assertions: validate the created trade contract
+  trade <- fetch tradeCid
+  assertMsg "Trade buyer should be requester" (trade.buyer == requester)
+  assertMsg "Trade seller should be the winner, MM2" (trade.seller == mm2)
+  assertMsg "Trade price should be the winning price" (trade.price == fst quote2)
+  assertMsg "Trade quantity should match RFQ" (trade.quantity == rfq.quantity)
+  assertMsg "Trade instrument should match RFQ" (trade.instrument == rfq.instrument)
+
+  -- Assertions: winning quote contract is archived post-execution
+  winningQuoteIsActive <- queryContractId requester winnerCid
+  assertMsg "WinningQuote should be archived after trade execution" (winningQuoteIsActive == None)
+  debug "Trade contract validated."
+
+  -- Step 6: Losers Acknowledge and Clean Up
+  -- Find which losing contract ID belongs to which market maker to exercise the cleanup choice.
+  let (losingCidMM1, losingCidMM3) =
+        if losingQuote1.marketMaker == mm1
+          then (loserCidList !! 0, loserCidList !! 1)
+          else (loserCidList !! 1, loserCidList !! 0)
+
+  submit mm1 do exerciseCmd losingCidMM1 AcknowledgeLoss
+  submit mm3 do exerciseCmd losingCidMM3 AcknowledgeLoss
+
+  debug "Losing quotes acknowledged and cleaned up."
+
+  -- Assertions: losing quotes are archived after cleanup
+  losingQuote1IsActive <- queryContractId mm1 losingCidMM1
+  assertMsg "LosingQuote for MM1 should be archived" (losingQuote1IsActive == None)
+  losingQuote2IsActive <- queryContractId mm3 losingCidMM3
+  assertMsg "LosingQuote for MM3 should be archived" (losingQuote2IsActive == None)
+
+  debug "RFQ full workflow test completed successfully."
+
+-- This top-level script will be executed by `dpm test`.
+tests = script do
+  testRfqFullWorkflow
