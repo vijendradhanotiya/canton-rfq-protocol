@@ -1,0 +1,116 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RFQ.WinnerSelection where
+
+import DA.List (head, sortOn)
+import DA.Optional (fromSome)
+import DA.Assert (assertMsg)
+import DA.Text (Text, show)
+
+-- This example uses the Daml Finance Fungible interface for asset representation.
+-- In a real-world scenario, you would add `daml-finance-interfaces` to your `daml.yaml`.
+-- For simplicity, if you don't have this dependency, you could replace `I` with a simple
+-- `Text` field for the asset name.
+import Daml.Finance.Interface.Asset.Fungible (I)
+
+import RFQ.Request (Request(..), Direction(..))
+import RFQ.SealedQuote (SealedQuote(..))
+
+-- | Represents the plaintext quote information received off-ledger from a market maker.
+-- This data is provided by the requester to the `WinnerSelection` contract to initiate
+-- the winner selection process.
+data UnsealedQuote = UnsealedQuote
+  with
+    sealedQuoteCid: ContractId SealedQuote
+    price: Decimal
+    nonce: Text
+  deriving (Eq, Show)
+
+-- | The resulting contract from a successful RFQ, representing the confirmed trade.
+-- It is created when the requester selects the winning quote and serves as a bilateral
+-- agreement between the requester and the winning market maker.
+template WinningQuote
+  with
+    tradeId: Text
+    requester: Party
+    marketMaker: Party
+    asset: I
+    quantity: Decimal
+    price: Decimal
+    direction: Direction
+  where
+    signatory requester, marketMaker
+
+    key (requester, tradeId) : (Party, Text)
+    maintainer key._1
+
+    -- In a full production implementation, this contract would likely have choices
+    -- to proceed with settlement, for example, initiating a Delivery-vs-Payment (DvP)
+    -- workflow using Daml Finance primitives. For this example, it stands as a static
+    -- record of the agreed trade.
+
+-- | A transient contract used by the requester to orchestrate the winner selection process.
+-- The requester creates this contract, providing the off-ledger revealed quotes, and then
+-- exercises the `SelectWinner` choice to atomically select the best quote, archive all
+-- sealed quotes, and create the `WinningQuote` contract.
+template WinnerSelection
+  with
+    requester: Party
+    requestCid: ContractId Request
+    unsealedQuotes: [UnsealedQuote]
+  where
+    signatory requester
+
+    choice SelectWinner : ContractId WinningQuote
+      controller requester
+      do
+        -- 1. Pre-conditions
+        assertMsg "At least one quote must be provided to select a winner" (not $ null unsealedQuotes)
+
+        -- 2. Fetch original RFQ to get trade parameters and verify ownership
+        request <- fetch requestCid
+        assertMsg "Controller must be the original RFQ requester" (request.requester == requester)
+
+        -- 3. Atomically verify all submitted quotes against their on-ledger hashes
+        --    and archive the `SealedQuote` contracts. This relies on a `VerifyAndArchive`
+        --    choice on the `SealedQuote` template, which must perform the hash check.
+        let
+          verifyAndPair (unsealed: UnsealedQuote) = do
+            -- This choice consumes the `SealedQuote` contract and returns the maker.
+            -- This is critical, as it ensures all losing quotes are removed from the ACS
+            -- within this single, atomic transaction.
+            maker <- exercise unsealed.sealedQuoteCid VerifyAndArchive with
+              price = unsealed.price
+              nonce = unsealed.nonce
+            return (maker, unsealed.price)
+
+        makersAndPrices <- mapA verifyAndPair unsealedQuotes
+
+        -- 4. Determine the best quote based on the trade direction
+        let
+          winnerTuple = case request.direction of
+            -- For a buy order, the requester wants the lowest price.
+            Buy  -> fromSome (error "Could not determine minimum price from quotes") $
+                      head $ sortOn (\(_, p) -> p) makersAndPrices
+
+            -- For a sell order, the requester wants the highest price.
+            Sell -> fromSome (error "Could not determine maximum price from quotes") $
+                      head $ sortOn (\(_, p) -> -p) makersAndPrices
+
+          (winningMaker, winningPrice) = winnerTuple
+
+        -- 5. Archive the original RFQ contract as it has been fulfilled.
+        exercise requestCid Archive
+
+        -- 6. Create the final `WinningQuote` contract with the selected market maker.
+        --    The tradeId is derived from the original request and the winner for uniqueness.
+        let tradeId = show requestCid <> "-" <> show winningMaker
+        create WinningQuote with
+          tradeId
+          requester = request.requester
+          marketMaker = winningMaker
+          asset = request.asset
+          quantity = request.quantity
+          price = winningPrice
+          direction = request.direction
