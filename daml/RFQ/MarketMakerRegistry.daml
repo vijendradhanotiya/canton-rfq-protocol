@@ -1,0 +1,216 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module RFQ.MarketMakerRegistry where
+
+import Daml.Script
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Time (Time)
+import DA.Assert ((===))
+
+-- | Encapsulates the performance and reputation data for a single market maker.
+data MarketMakerData = MarketMakerData
+  with
+    -- | A score from 0.0 to 100.0 indicating reliability and performance.
+    reputationScore : Decimal
+    -- | The total number of trades successfully executed by the market maker.
+    tradesCompleted : Int
+    -- | The total number of trades that failed to execute (e.g., expired, rejected).
+    tradesFailed : Int
+    -- | The timestamp when the market maker was added to the registry.
+    joinedAt : Time
+  deriving (Eq, Show)
+
+-- | Calculates the reputation score based on the ratio of successful trades.
+-- A new market maker starts at 100.0.
+calculateReputation : Int -> Int -> Decimal
+calculateReputation completed failed =
+  let total = completed + failed
+  in if total == 0
+      then 100.0
+      else intToDecimal completed * 100.0 / intToDecimal total
+
+-- | A contract representing the status of a single approved market maker.
+-- | This contract is observable only by the registry operator and the market maker itself,
+-- | ensuring the list of all registered market makers remains private to the operator.
+template MarketMakerStatus
+  with
+    operator : Party
+    marketMaker : Party
+    data : MarketMakerData
+  where
+    signatory operator
+    observer marketMaker
+
+    key (operator, marketMaker) : (Party, Party)
+    maintainer key._1
+
+    choice RecordTrade : ContractId MarketMakerStatus
+      -- | Records the outcome of a trade, updating the market maker's statistics
+      -- | and recalculating their reputation score.
+      with
+        wasSuccessful : Bool
+      controller operator
+      do
+        let
+          newCompleted = if wasSuccessful then data.tradesCompleted + 1 else data.tradesCompleted
+          newFailed = if wasSuccessful then data.tradesFailed else data.tradesFailed + 1
+          newScore = calculateReputation newCompleted newFailed
+          newData = data with
+            tradesCompleted = newCompleted
+            , tradesFailed = newFailed
+            , reputationScore = newScore
+        create this with data = newData
+
+-- | The central registry for all market makers approved to participate in the RFQ protocol.
+-- | The operator is the sole manager of this registry. The list of approved market makers
+-- | is kept private to the operator.
+template Registry
+  with
+    operator : Party
+    -- | The set of parties that are approved market makers.
+    approvedMarketMakers : Set Party
+  where
+    signatory operator
+
+    key operator : Party
+    maintainer key
+
+    -- | Non-consuming choice to check if a party is an approved market maker.
+    -- | This is callable only by the operator and is useful for internal validation.
+    nonconsuming choice IsApproved : Bool
+      with
+        partyToCheck : Party
+      controller operator
+      do
+        return $ Set.member partyToCheck approvedMarketMakers
+
+    choice AddMarketMaker : ContractId MarketMakerStatus
+      -- | Onboards a new market maker into the registry. This creates a corresponding
+      -- | `MarketMakerStatus` contract for the new member and recreates the `Registry`
+      -- | to update its internal state.
+      with
+        marketMaker : Party
+        joinedAt : Time
+      controller operator
+      do
+        assertMsg "Market maker is already registered" $
+          not $ Set.member marketMaker approvedMarketMakers
+
+        -- Recreate the registry contract with the new market maker added
+        create this with approvedMarketMakers = Set.insert marketMaker this.approvedMarketMakers
+
+        -- Create the private status contract for the new market maker
+        let initialData = MarketMakerData with
+              reputationScore = 100.0
+              , tradesCompleted = 0
+              , tradesFailed = 0
+              , joinedAt
+        create MarketMakerStatus with operator, marketMaker, data = initialData
+
+    choice RemoveMarketMaker : ContractId Registry
+      -- | Offboards a market maker from the registry. This archives their
+      -- | `MarketMakerStatus` contract and recreates the `Registry` to reflect the removal.
+      with
+        marketMaker : Party
+      controller operator
+      do
+        assertMsg "Market maker is not registered" $
+          Set.member marketMaker approvedMarketMakers
+
+        -- Fetch and archive the market maker's status contract using its key
+        (statusCid, _status) <- fetchByKey @MarketMakerStatus (operator, marketMaker)
+        archive statusCid
+
+        -- Recreate the registry contract with the market maker removed
+        create this with approvedMarketMakers = Set.delete marketMaker this.approvedMarketMakers
+
+
+-- === Test Suite ===
+
+testRegistryLifecycle : Script ()
+testRegistryLifecycle = script do
+  operator <- allocateParty "Operator"
+  mm1 <- allocateParty "MarketMaker1"
+  mm2 <- allocateParty "MarketMaker2"
+
+  -- Initial registry creation
+  now <- getTime
+  registryCid <- submit operator do
+    createCmd Registry with operator, approvedMarketMakers = Set.empty
+
+  -- Add MarketMaker1
+  status1Cid <- submit operator do
+    exerciseCmd registryCid AddMarketMaker with marketMaker = mm1, joinedAt = now
+
+  -- Verify MM1 is approved. Note that we must exercise on the *original* registryCid,
+  -- as the AddMarketMaker choice archives it and creates a new one. The original cid
+  -- remains valid for one transaction. For subsequent checks, we'd need to query
+  -- for the new registry contract.
+  isApproved1 <- submit operator do
+    exerciseCmd registryCid IsApproved with partyToCheck = mm1
+  assert isApproved1
+
+  -- Verify MM2 is not yet approved
+  isApproved2 <- submit operator do
+    exerciseCmd registryCid IsApproved with partyToCheck = mm2
+  assert $ not isApproved2
+
+  -- Add MarketMaker2. This archives the registryCid and creates registryCid2
+  (registryCid2, status2Cid) <- submit operator do
+    (registryCid', statusCid') <- exerciseCmd registryCid AddMarketMaker with marketMaker = mm2, joinedAt = now
+    -- This is a pattern to return multiple results from a submit block.
+    -- However, AddMarketMaker only returns one result. A better pattern is to query after.
+    -- For this test's purpose, we'll just query for the new registry.
+    pure statusCid'
+  [(_, registryCidNew)] <- queryContracts (All, operator) (templateId @Registry)
+  let registryCid2 = registryCidNew.contractId
+
+
+  -- Try to add MM1 again, should fail as they are already in the set.
+  submitMustFail operator do
+    exerciseCmd registryCid2 AddMarketMaker with marketMaker = mm1, joinedAt = now
+
+  -- MM1 completes a trade successfully
+  updatedStatus1Cid <- submit operator do
+    exerciseCmd status1Cid RecordTrade with wasSuccessful = True
+
+  -- Check updated stats for MM1
+  updatedStatus1 <- fetch updatedStatus1Cid
+  updatedStatus1.data.tradesCompleted === 1
+  updatedStatus1.data.tradesFailed === 0
+  updatedStatus1.data.reputationScore === 100.0
+
+  -- MM2 has a failed trade
+  updatedStatus2Cid <- submit operator do
+    exerciseCmd status2Cid RecordTrade with wasSuccessful = False
+
+  -- Check updated stats for MM2
+  updatedStatus2 <- fetch updatedStatus2Cid
+  updatedStatus2.data.tradesCompleted === 0
+  updatedStatus2.data.tradesFailed === 1
+  updatedStatus2.data.reputationScore === 0.0
+
+  -- MM2 has a successful trade, reputation should go to 50%
+  updatedStatus2Cid' <- submit operator do
+    exerciseCmd updatedStatus2Cid RecordTrade with wasSuccessful = True
+  updatedStatus2' <- fetch updatedStatus2Cid'
+  updatedStatus2'.data.tradesCompleted === 1
+  updatedStatus2'.data.tradesFailed === 1
+  updatedStatus2'.data.reputationScore === 50.0
+
+  -- Remove MM1
+  registryCid3 <- submit operator do
+    exerciseCmd registryCid2 RemoveMarketMaker with marketMaker = mm1
+
+  -- Verify MM1 is no longer approved
+  isApproved1AfterRemove <- submit operator do
+    exerciseCmd registryCid3 IsApproved with partyToCheck = mm1
+  assert $ not isApproved1AfterRemove
+
+  -- Verify their status contract is gone
+  fetchByKey @MarketMakerStatus (operator, mm1) === None
+
+  return ()
