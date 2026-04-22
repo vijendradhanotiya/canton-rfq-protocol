@@ -1,73 +1,120 @@
--- | This module defines the core Request for Quote (RFQ) template.
--- It allows a requester to broadcast a request to a list of approved market makers,
--- initiating the sealed-quote workflow.
+-- | This module defines the core `Request` template for the RFQ (Request for Quotation) workflow.
+-- It allows a requester to broadcast a trade inquiry to multiple market makers and sets the
+-- parameters for the quotation and selection process.
+--
+-- The key feature added in this version is the `minQuoteCount`, which ensures that the
+-- winner selection process cannot begin until a minimum threshold of quotes has been received,
+-- promoting competitive pricing.
 module RFQ.Request where
 
-import DA.Assert
-import DA.Time (Time)
+import Daml.Script
+import DA.Time (Time, getTime)
+import DA.Assert ((assertMsg))
+import DA.Next.Set (fromList)
 
--- Forward import for the sealed quote contract, which will be created by a choice on this template.
-import RFQ.Quote (SealedQuote)
+import RFQ.SealedQuote (SealedQuote)
+import RFQ.WinnerSelection (WinnerSelection)
 
--- | Represents the side of a trade. The requester is either looking to Buy or Sell the asset.
+-- | Represents the side of a trade, either Buy or Sell.
 data Side = Buy | Sell
   deriving (Eq, Show, Ord)
 
--- | Represents a request for a quote broadcast to multiple market makers.
--- The requester creates this contract to solicit quotes for a specific asset.
--- Market makers observe this contract and can respond by submitting a sealed quote.
+-- | The core Request for Quotation (RFQ) contract.
+-- This contract is created by a requester and is observable by a list of approved market makers.
+-- It specifies the terms of the desired trade and the rules for the quotation process.
 template Request
   with
-    requester      : Party    -- ^ The party requesting the quote.
-    marketMakers   : [Party]  -- ^ The list of parties invited to provide a quote.
-    requestId      : Text     -- ^ A unique identifier for this RFQ, chosen by the requester.
-    asset          : Text     -- ^ The asset to be traded, e.g., "BTC/USD".
-    side           : Side     -- ^ Whether the requester wants to buy or sell the base asset.
-    quantity       : Decimal  -- ^ The amount of the asset to be traded.
-    quoteDeadline  : Time     -- ^ The time by which market makers must submit their sealed quotes.
+    requester         : Party    -- ^ The party initiating the RFQ.
+    marketMakers      : [Party]  -- ^ The list of market makers invited to quote.
+    requestId         : Text     -- ^ A unique identifier for this RFQ.
+    instrument        : Text     -- ^ The financial instrument to be traded (e.g., "BTC/USD").
+    side              : Side     -- ^ The side of the trade (Buy or Sell).
+    quantity          : Decimal  -- ^ The quantity of the instrument to be traded.
+    selectionDeadline : Time     -- ^ The deadline by which the requester must select a winning quote.
+    minQuoteCount     : Int      -- ^ The minimum number of quotes required before winner selection can occur.
   where
     signatory requester
     observer marketMakers
 
-    ensure
-      quantity > 0.0 &&
-      not (null marketMakers) &&
-      notElem requester marketMakers
-
     key (requester, requestId) : (Party, Text)
     maintainer key._1
 
-    -- | Allows a market maker to submit a sealed quote in response to the RFQ.
-    -- This choice creates a `SealedQuote` contract, which holds the hash of the quote details.
-    -- The actual quote is not revealed at this stage, preserving confidentiality until the
-    -- selection process begins.
-    choice SubmitSealedQuote : ContractId SealedQuote
+    ensure
+      minQuoteCount > 0 && minQuoteCount <= length marketMakers
+        && "Minimum quote count must be positive and not exceed the number of market makers."
+      && not (null marketMakers) && "Market makers list cannot be empty."
+
+    -- | Allows an invited market maker to submit a sealed (hashed) quote in response to the RFQ.
+    -- This creates a `SealedQuote` contract which holds the hash and is only visible
+    -- to the submitting market maker and the requester.
+    nonconsuming choice SubmitSealedQuote
+      : ContractId SealedQuote
       with
-        quoteHash: Text -- ^ A SHA256 hash of the quote details (price, timestamp, salt).
-      controller responder
+        quoteHash : Text  -- ^ The SHA256 hash of the quote details (price, nonce).
+      controller marketMaker : Party
       do
         -- Ensure the controller is one of the invited market makers.
-        assertMsg "Controller must be an invited market maker" $
-          elem responder marketMakers
+        assertMsg (show marketMaker <> " is not an invited market maker for this RFQ.")
+          (marketMaker `elem` marketMakers)
 
-        -- Ensure the submission is before the deadline.
-        now <- getTime
-        assertMsg "Quote submission deadline has passed" $
-          now <= quoteDeadline
-
-        -- Create the sealed quote contract, linking it back to this RFQ.
+        -- Create the sealed quote contract.
         create SealedQuote with
           requester
-          marketMaker = responder
+          marketMaker
           requestId
           quoteHash
 
-    -- | Allows the requester to cancel the RFQ before the deadline has passed.
-    -- This is useful if the requester's needs change or if the request was made in error.
-    choice Cancel : ()
+    -- | Allows the requester to initiate the winner selection process after collecting quotes.
+    -- This choice is only exercisable after the minimum number of quotes has been received
+    -- and before the selection deadline. It archives the `Request` and creates a
+    -- `WinnerSelection` contract to proceed to the next stage of the workflow.
+    choice SelectWinner
+      : ContractId WinnerSelection
+      with
+        sealedQuoteCids : [ContractId SealedQuote] -- ^ A list of `SealedQuote` contract IDs to consider.
       controller requester
       do
+        -- Enforce the selection deadline.
         now <- getTime
-        assertMsg "Cannot cancel RFQ after the quote deadline" $
-          now < quoteDeadline
-        return ()
+        assertMsg ("Winner selection is only allowed before the deadline of " <> show selectionDeadline)
+          (now <= selectionDeadline)
+
+        -- Enforce the minimum quote count.
+        let submittedCount = length sealedQuoteCids
+        assertMsg ("Minimum quote count not met. Required: " <> show minQuoteCount <> ", Submitted: " <> show submittedCount)
+          (submittedCount >= minQuoteCount)
+
+        -- Fetch and validate all submitted quotes.
+        quotesData <- forA sealedQuoteCids \cid -> do
+          quote <- fetch cid
+          -- Verify the quote belongs to this RFQ.
+          assertMsg ("Quote " <> show cid <> " does not belong to request " <> requestId)
+            (quote.requestId == requestId)
+          -- Verify the quote is from an invited market maker.
+          assertMsg ("Quote " <> show cid <> " is from an uninvited party " <> show quote.marketMaker)
+            (quote.marketMaker `elem` marketMakers)
+          return quote
+
+        -- Ensure no duplicate quotes from the same market maker.
+        let submittedMakers = fromList $ map (.marketMaker) quotesData
+        assertMsg "Duplicate quotes from the same market maker are not allowed."
+          (length submittedMakers == submittedCount)
+
+        -- Archive the RFQ request and proceed to the winner selection stage.
+        create WinnerSelection with
+          request = self
+          sealedQuotes = zip sealedQuoteCids quotesData
+
+    -- | Allows the requester to cancel the RFQ before the deadline.
+    -- This is useful if market conditions change or if insufficient interest is shown.
+    choice Cancel
+      : ()
+      with
+      controller requester
+      do
+        -- Cancellation is only allowed before the deadline has passed.
+        now <- getTime
+        assertMsg "Cannot cancel an RFQ after the selection deadline has passed."
+          (now <= selectionDeadline)
+        -- The consuming nature of the choice archives the contract.
+        pure ()
