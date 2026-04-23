@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    name: Build & Test Daml Contracts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install DPM (Daml Package Manager)
+        run: curl https://get.digitalasset.com/install/install.sh | sh
+
+      - name: Add DPM to PATH
+        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+
+      - name: Cache DPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.dpm/packages
+          key: ${{ runner.os }}-dpm-${{ hashFiles('daml.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-dpm-
+
+      - name: Build Daml contracts
+        run: dpm build
+
+      - name: Run Daml Script tests
+        run: dpm test
